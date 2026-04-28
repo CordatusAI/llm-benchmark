@@ -23,10 +23,21 @@ An interactive Streamlit application for benchmarking LLM inference servers with
 
 ## Quick Start
 
+### Option 1: Local
+
 ```bash
 pip install -r requirements.txt
 streamlit run benchmark.py
 ```
+
+### Option 2: Docker
+
+```bash
+docker build -t llm-benchmark .
+docker run -p 8501:8501 --add-host=host.docker.internal:host-gateway llm-benchmark
+```
+
+> `--add-host=host.docker.internal:host-gateway` is needed if your LLM server runs on the host machine. If the server is reachable via a regular IP/hostname, you can omit this flag.
 
 ## Usage
 
