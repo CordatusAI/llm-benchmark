@@ -1,0 +1,6 @@
+httpx
+openai
+pandas
+plotly
+requests
+streamlit
