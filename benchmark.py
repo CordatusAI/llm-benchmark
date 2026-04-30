@@ -652,7 +652,7 @@ def main() -> None:
         help="Refresh model list from server"
     ) and base_url:
         with st.spinner("Fetching model list..."):
-            new_models = get_model_list(base_url)
+            new_models = get_model_list(base_url, api_key= api_key)
 
         if new_models:
             st.session_state.models = new_models
