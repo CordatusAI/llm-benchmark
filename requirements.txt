@@ -1,4 +1,5 @@
 httpx
+kaleido
 openai
 pandas
 plotly

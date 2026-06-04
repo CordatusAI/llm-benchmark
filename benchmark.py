@@ -639,10 +639,14 @@ def main() -> None:
     # Input controls
     base_url = st.sidebar.text_input("Base URL", value=DEFAULT_BASE_URL)
 
-    # Handle base URL changes
+    # Handle base URL changes or initial load
     if base_url != st.session_state.last_base_url:
-        st.session_state.models = []
         st.session_state.last_base_url = base_url
+        fetched = get_model_list(base_url, api_key=api_key)
+        if fetched:
+            st.session_state.models = fetched
+        else:
+            st.session_state.models = []
         st.rerun()
 
     # Refresh models button
@@ -697,30 +701,35 @@ def main() -> None:
         )
 
     if st.sidebar.button("Run Benchmark"):
-        if 'sonuc' in st.session_state:
-            del st.session_state.sonuc
+        if not model:
+            st.error("Please select a model first! Click '🔄 Refresh Models' to load the model list.")
+        elif not concurrency_levels:
+            st.error("Please select at least one concurrency level.")
+        else:
+            if 'sonuc' in st.session_state:
+                del st.session_state.sonuc
 
-        with st.spinner("Running benchmark..."):
-            prompts = load_prompts()
-            if not prompts:
-                st.error("Could not load prompts. Please check the prompts.txt file.")
-            else:
-                try:
-                    benchmark = LLMBenchmark(base_url, api_key, model)
-                    all_metrics = asyncio.run(
-                        benchmark.run(prompts, DEFAULT_MAX_TOKENS, concurrency_levels)
-                    )
+            with st.spinner("Running benchmark..."):
+                prompts = load_prompts()
+                if not prompts:
+                    st.error("Could not load prompts. Please check the prompts.txt file.")
+                else:
+                    try:
+                        benchmark = LLMBenchmark(base_url, api_key, model)
+                        all_metrics = asyncio.run(
+                            benchmark.run(prompts, DEFAULT_MAX_TOKENS, concurrency_levels)
+                        )
 
-                    if all_metrics:
-                        df = create_results_dataframe(all_metrics)
-                        figures = benchmark.plot_results(all_metrics)
-                        model_name = model.split('/')[-1]
-                        st.session_state.sonuc = (model_name, df, figures, all_metrics)
-                    else:
-                        st.error("No benchmark results were generated.")
-                except Exception as e:
-                    logger.error(f"Benchmark failed: {e}")
-                    st.error(f"Benchmark failed: {e}")
+                        if all_metrics:
+                            df = create_results_dataframe(all_metrics)
+                            figures = benchmark.plot_results(all_metrics)
+                            model_name = model.split('/')[-1] if model else "unknown"
+                            st.session_state.sonuc = (model_name, df, figures, all_metrics)
+                        else:
+                            st.error("No benchmark results were generated.")
+                    except Exception as e:
+                        logger.error(f"Benchmark failed: {e}")
+                        st.error(f"Benchmark failed: {e}")
 
     if 'sonuc' in st.session_state:
         model_name, df, figures, all_metrics = st.session_state.sonuc
