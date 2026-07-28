@@ -103,17 +103,26 @@ class LLMBenchmark:
         self.api_key = api_key
         self.model = model
 
-        # Disable SSL verification (security risk — only use in test/dev environments)
+        self._build_client(read_timeout=300.0)
+
+    def _build_client(self, read_timeout: float) -> None:
+        """
+        (Re)build the OpenAI client with a given read timeout.
+
+        Uses a generous initial read timeout so that the single-request
+        calibration phase can complete before we tighten the value based
+        on observed latency.
+        """
         http_client = httpx.Client(
             verify=False,
         )
 
         self.client = OpenAI(
-            base_url=self.base_url, 
-            api_key=api_key if api_key else None,
-            timeout=httpx.Timeout(60.0, connect=10.0, read=30.0, write=10.0),
+            base_url=self.base_url,
+            api_key=self.api_key if self.api_key else None,
+            timeout=httpx.Timeout(60.0, connect=10.0, read=read_timeout, write=10.0),
             max_retries=3,
-            http_client=http_client
+            http_client=http_client,
         )
 
     def measure_single(self, prompt: str, max_tokens: int) -> Dict:
@@ -236,7 +245,8 @@ class LLMBenchmark:
         return result
 
     async def run_concurrent(self, prompts: List[str], max_tokens: int, 
-                           concurrency: int, progress_callback) -> List[Dict]:
+                           concurrency: int, progress_callback,
+                           batch_timeout: float = 300.0) -> List[Dict]:
         """
         Run benchmark with concurrent requests.
 
@@ -245,6 +255,7 @@ class LLMBenchmark:
             max_tokens: Maximum tokens per response
             concurrency: Number of concurrent requests
             progress_callback: Callback function to update progress
+            batch_timeout: Total wall-clock budget for this batch, in seconds.
 
         Returns:
             List of benchmark results
@@ -253,7 +264,7 @@ class LLMBenchmark:
         results = []
 
         # Add timeout to concurrent execution
-        async with asyncio.timeout(300):  # 5 minutes total timeout
+        async with asyncio.timeout(batch_timeout):
             with ThreadPoolExecutor(max_workers=concurrency) as executor:
                 futures = [
                     loop.run_in_executor(
@@ -414,9 +425,32 @@ class LLMBenchmark:
         Returns:
             Dictionary containing all benchmark results
         """
+        concurrency_levels = sorted(concurrency_levels)
+        max_conc = max(concurrency_levels) if concurrency_levels else 1
+
         st.write("Warm Up Started ... ")
         self.measure_single("What is warmup?", 32)
         st.write("Warm Up Ended ...")
+
+        st.write("Calibrating with a single representative request ...")
+        calib = self.measure_single(prompts[0], max_tokens) if prompts else {"error": "no prompts"}
+        if "error" in calib:
+            calib_latency = 10.0
+            calib_ttft_s = 5.0
+            st.warning(
+                f"Calibration failed ({calib['error']}). "
+                f"Using fallback latency={calib_latency:.1f}s, ttft={calib_ttft_s:.1f}s."
+            )
+        else:
+            calib_latency = calib["latency"]
+            calib_ttft_s = calib["ttft"] / TO_MS
+
+        read_timeout = max(60.0, calib_ttft_s * max_conc * 0.4 + 30.0)
+        self._build_client(read_timeout)
+        st.write(
+            f"Calibration: latency={calib_latency:.2f}s, ttft={calib_ttft_s:.2f}s "
+            f"=> read_timeout={read_timeout:.0f}s"
+        )
 
         all_metrics = {}
         total_tasks = sum(MIN_ROUNDS * conc for conc in concurrency_levels)
@@ -429,6 +463,7 @@ class LLMBenchmark:
             progress = min(completed_tasks / total_tasks, 1.0)
             progress_bar.progress(progress)
 
+        prev_latency = calib_latency
         for conc in concurrency_levels:
             needed = MIN_ROUNDS * conc
             if needed <= len(prompts):
@@ -436,10 +471,17 @@ class LLMBenchmark:
             else:
                 batch = [prompts[i % len(prompts)] for i in range(needed)]
 
-            st.write(f"Running with concurrency level: {conc} ({len(batch)} prompts, {len(batch)//conc} rounds)")
+            batch_timeout = max(300.0, MIN_ROUNDS * prev_latency * 3.0)
+            st.write(
+                f"Running with concurrency level: {conc} "
+                f"({len(batch)} prompts, {len(batch)//conc} rounds) "
+                f"| batch_timeout={batch_timeout:.0f}s (prev_latency={prev_latency:.1f}s)"
+            )
 
             try:
-                results = await self.run_concurrent(batch, max_tokens, conc, update_progress)
+                results = await self.run_concurrent(
+                    batch, max_tokens, conc, update_progress, batch_timeout
+                )
                 metrics = self.calculate_metrics(results)
 
                 if "error" in metrics:
@@ -447,6 +489,7 @@ class LLMBenchmark:
                     continue
 
                 all_metrics[conc] = metrics
+                prev_latency = metrics["Latency"]["mean"]
                 st.write(f"Metrics for concurrency level {conc}:")
                 st.json(metrics)
 
