@@ -72,8 +72,9 @@ Each metric is reported with **Mean**, **P50** (median), and **P90** (90th perce
 | Prompt count | 100 | Diverse prompts loaded from `prompts.txt` (auto-shuffled each run) |
 | Prompt length | ~128 tokens | Each prompt explicitly requests at least 128 tokens |
 | Max output tokens | 128 | Responses truncated after 128 tokens (`DEFAULT_MAX_TOKENS`) |
-| Min rounds per concurrency | 10 | Each concurrency level runs at least 10 rounds (`MIN_ROUNDS`) |
-| Total requests per level | 10 × concurrency | e.g., concurrency=8 → 80 requests, concurrency=16 → 160 |
+| Measured rounds per concurrency | 10 | Each concurrency level runs 10 measured rounds (`MEASURED_ROUNDS`) |
+| Warmup rounds per concurrency | 1 | Each concurrency level runs 1 warmup round (`WARMUP_ROUNDS`); results discarded |
+| Total requests per level | 11 × concurrency | e.g., concurrency=8 → 88 requests (8 warmup + 80 measured) |
 
 Both input and output are approximately 128 tokens, creating a consistent and reproducible benchmark workload.
 
@@ -148,7 +149,8 @@ Constants can be modified at the top of `benchmark.py`:
 | `DEFAULT_BASE_URL` | `http://127.0.1.1:8000/v1` | Default API endpoint |
 | `DEFAULT_MAX_TOKENS` | 128 | Max tokens per completion |
 | `DEFAULT_CONCURRENCY_LEVELS` | [1, 2, 4, 8] | Concurrency levels to test |
-| `MIN_ROUNDS` | 10 | Minimum rounds per concurrency level |
+| `MEASURED_ROUNDS` | 10 | Measured rounds per concurrency level |
+| `WARMUP_ROUNDS` | 1 | Warmup rounds per concurrency level (results discarded) |
 | `DEFAULT_TTFT_SLO` | 1000 | TTFT threshold (ms) |
 | `DEFAULT_TPS_SLO` | 15 | TPS threshold (tokens/s) |
 | `DEFAULT_THINK_TIME` | 45 | Think time (seconds) |

@@ -28,7 +28,8 @@ TO_MS = 1000
 DEFAULT_BASE_URL = "http://127.1.1.1:8000/v1"
 DEFAULT_MAX_TOKENS = 128
 DEFAULT_CONCURRENCY_LEVELS = [1, 2, 4, 8]
-MIN_ROUNDS = 10
+MEASURED_ROUNDS = 10
+WARMUP_ROUNDS = 1
 DEFAULT_TTFT_SLO = 1000
 DEFAULT_TPS_SLO = 15
 DEFAULT_THINK_TIME = 45
@@ -453,7 +454,7 @@ class LLMBenchmark:
         )
 
         all_metrics = {}
-        total_tasks = sum(MIN_ROUNDS * conc for conc in concurrency_levels)
+        total_tasks = sum(MEASURED_ROUNDS * conc for conc in concurrency_levels)
         progress_bar = st.progress(0)
         completed_tasks = 0
 
@@ -465,13 +466,35 @@ class LLMBenchmark:
 
         prev_latency = calib_latency
         for conc in concurrency_levels:
-            needed = MIN_ROUNDS * conc
+            warmup_needed = WARMUP_ROUNDS * conc
+            if warmup_needed <= len(prompts):
+                warmup_batch = prompts[:warmup_needed]
+            else:
+                warmup_batch = [prompts[i % len(prompts)] for i in range(warmup_needed)]
+
+            warmup_timeout = max(300.0, WARMUP_ROUNDS * prev_latency * 3.0)
+            logger.info(
+                f"Warmup for concurrency {conc}: {len(warmup_batch)} requests "
+                f"(timeout={warmup_timeout:.0f}s)"
+            )
+            try:
+                await self.run_concurrent(
+                    warmup_batch, max_tokens, conc,
+                    lambda c, t: None, warmup_timeout
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Warmup failed for concurrency {conc}: {e}. "
+                    f"Proceeding with measurement."
+                )
+
+            needed = MEASURED_ROUNDS * conc
             if needed <= len(prompts):
                 batch = prompts[:needed]
             else:
                 batch = [prompts[i % len(prompts)] for i in range(needed)]
 
-            batch_timeout = max(300.0, MIN_ROUNDS * prev_latency * 3.0)
+            batch_timeout = max(300.0, MEASURED_ROUNDS * prev_latency * 3.0)
             st.write(
                 f"Running with concurrency level: {conc} "
                 f"({len(batch)} prompts, {len(batch)//conc} rounds) "
