@@ -17,7 +17,7 @@ An interactive Streamlit application for benchmarking LLM inference servers with
 - **Comprehensive Metrics** — TTFT, ITL, TPS, Latency, and Throughput with Mean/P50/P90 percentiles
 - **SLO-Driven Capacity Planning** — Determine max concurrency and total users based on configurable TTFT/TPS thresholds using Little's Law
 - **Interactive Visualizations** — Grouped bar charts (Mean vs P90) for all metrics via Plotly
-- **One-Click Download** — Export all results as a ZIP archive containing CSV tables, PNG charts, and interactive HTML plots
+- **One-Click Download** — Export all results as a ZIP archive containing CSV tables, PNG charts, interactive HTML plots, and the raw `models.json` payload from the server
 - **Streaming API** — Uses streaming completions with `include_usage` for accurate token counting; supports `reasoning_content` from reasoning models
 - **Warm-Up Mechanism** — Automatically sends a warm-up request before benchmarking to stabilize inference performance
 

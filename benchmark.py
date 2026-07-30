@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import time
 import zipfile
 import requests
@@ -13,7 +14,7 @@ import math
 import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
-from typing import Dict, List
+from typing import Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 
@@ -38,19 +39,17 @@ PROMPTS_FILE = "prompts.txt"
 LOGO_PATH = "images/CORDATUS_LOGO.png"
 REQUEST_TIMEOUT = 50
 
-def get_model_list(url: str, api_key:str= API_KEY) -> List[str]:
+def get_models_payload(url: str, api_key: str = API_KEY) -> Optional[Dict]:
     """
-    Returns a list of model IDs from an OpenAI compatible server.
-    The model list is dynamic and not cached.
+    Fetch the raw /models JSON payload from an OpenAI compatible server.
 
     Args:
         url: API base URL
+        api_key: API key for authentication
 
     Returns:
-        List of model IDs
-
-    Raises:
-        requests.exceptions.RequestException: If API request fails
+        Raw response dict (e.g. {"object": "list", "data": [...]}),
+        or None if the request failed or response was not valid JSON.
     """
     try:
         response = requests.get(
@@ -60,29 +59,47 @@ def get_model_list(url: str, api_key:str= API_KEY) -> List[str]:
                 "Accept": "application/json",
                 "Authorization": f"Bearer {api_key}"
             },
-             verify=False
+            verify=False
         )
         response.raise_for_status()
-        data = response.json()
-        model_ids = [model['id'] for model in data.get('data', [])]
-
-        if not model_ids:
-            logger.warning("Could not retrieve model list from server.")
-
-        return model_ids
+        return response.json()
 
     except requests.exceptions.Timeout:
         logger.warning(f"Server timed out ({REQUEST_TIMEOUT}s)")
-        return []
+        return None
     except requests.exceptions.ConnectionError:
         logger.warning("Could not connect to server. Check URL.")
-        return []
+        return None
     except requests.exceptions.RequestException as e:
         logger.error(f"API Error: {str(e)}")
-        return []
-    except (ValueError, KeyError) as e:
+        return None
+    except ValueError as e:
         logger.error(f"Error parsing response: {str(e)}")
+        return None
+
+
+def get_model_list(url: str, api_key: str = API_KEY) -> List[str]:
+    """
+    Returns a list of model IDs from an OpenAI compatible server.
+    The model list is dynamic and not cached.
+
+    Args:
+        url: API base URL
+        api_key: API key for authentication
+
+    Returns:
+        List of model IDs
+    """
+    payload = get_models_payload(url, api_key=api_key)
+    if not payload:
         return []
+
+    model_ids = [model['id'] for model in payload.get('data', [])]
+
+    if not model_ids:
+        logger.warning("Could not retrieve model list from server.")
+
+    return model_ids
 
 
 
@@ -546,7 +563,8 @@ def load_prompts() -> List[str]:
         return []
 
 
-def build_zip(model_name: str, df: pd.DataFrame, figures: Dict[str, go.Figure]) -> bytes:
+def build_zip(model_name: str, df: pd.DataFrame, figures: Dict[str, go.Figure],
+              models_payload: Optional[Dict] = None) -> bytes:
     zip_buffer = io.BytesIO()
     
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
@@ -565,6 +583,14 @@ def build_zip(model_name: str, df: pd.DataFrame, figures: Dict[str, go.Figure]) 
                 zip_file.writestr(f"{model_name}-{metric}.html", html_buffer.getvalue())
             except Exception as e:
                 logger.error(f"Error saving figure {metric}: {e}")
+
+        if models_payload:
+            try:
+                models_buffer = io.StringIO()
+                json.dump(models_payload, models_buffer, indent=2, ensure_ascii=False)
+                zip_file.writestr("models.json", models_buffer.getvalue())
+            except Exception as e:
+                logger.error(f"Error saving models.json: {e}")
     
     zip_buffer.seek(0)
     return zip_buffer.getvalue()
@@ -644,6 +670,8 @@ def initialize_session_state() -> None:
     """Initialize Streamlit session state variables."""
     if 'models' not in st.session_state:
         st.session_state.models = []
+    if 'models_payload' not in st.session_state:
+        st.session_state.models_payload = None
     if 'last_base_url' not in st.session_state:
         st.session_state.last_base_url = None
 
@@ -708,7 +736,9 @@ def main() -> None:
     # Handle base URL changes or initial load
     if base_url != st.session_state.last_base_url:
         st.session_state.last_base_url = base_url
-        fetched = get_model_list(base_url, api_key=api_key)
+        payload = get_models_payload(base_url, api_key=api_key)
+        st.session_state.models_payload = payload
+        fetched = [m['id'] for m in payload.get('data', [])] if payload else []
         if fetched:
             st.session_state.models = fetched
         else:
@@ -722,7 +752,9 @@ def main() -> None:
         help="Refresh model list from server"
     ) and base_url:
         with st.spinner("Fetching model list..."):
-            new_models = get_model_list(base_url, api_key= api_key)
+            payload = get_models_payload(base_url, api_key=api_key)
+            new_models = [m['id'] for m in payload.get('data', [])] if payload else []
+            st.session_state.models_payload = payload
 
         if new_models:
             st.session_state.models = new_models
@@ -830,7 +862,10 @@ def main() -> None:
             st.plotly_chart(fig, use_container_width=True)
 
         if 'zip_data' not in st.session_state or st.session_state.get('zip_model') != model_name:
-            st.session_state.zip_data = build_zip(model_name, df, figures)
+            st.session_state.zip_data = build_zip(
+                model_name, df, figures,
+                st.session_state.get('models_payload')
+            )
             st.session_state.zip_model = model_name
 
         st.sidebar.markdown("---")
