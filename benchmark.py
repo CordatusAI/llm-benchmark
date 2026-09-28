@@ -38,6 +38,7 @@ OUTPUT_DIR = "out"
 PROMPTS_FILE = "prompts.txt"
 LOGO_PATH = "images/CORDATUS_LOGO.png"
 REQUEST_TIMEOUT = 50
+MAX_RETRIES = 1
 
 def get_models_payload(url: str, api_key: str = API_KEY) -> Optional[Dict]:
     """
@@ -123,24 +124,45 @@ class LLMBenchmark:
 
         self._build_client(read_timeout=300.0)
 
-    def _build_client(self, read_timeout: float) -> None:
+    def _build_client(self, read_timeout: float,
+                      max_concurrency: int = 64) -> None:
         """
         (Re)build the OpenAI client with a given read timeout.
 
         Uses a generous initial read timeout so that the single-request
         calibration phase can complete before we tighten the value based
         on observed latency.
+
+        The connection pool is sized from the highest concurrency level under
+        test: httpx defaults to max 100 connections, which would queue requests
+        at concurrency 128/256 and corrupt TTFT/latency measurements.
+
+        The inter-chunk patience (chunk_timeout) also scales with the read
+        timeout so that slow streams at high concurrency are not truncated
+        early (truncation undercounts tokens and inflates TPS).
+
+        Limited to MAX_RETRIES so that silent retries under load do not
+        inflate measured latencies.
         """
-        http_client = httpx.Client(
+        old_http_client = getattr(self, "_http_client", None)
+        if old_http_client is not None:
+            old_http_client.close()
+
+        self.chunk_timeout = max(100.0, read_timeout / 2.0)
+        self._http_client = httpx.Client(
             verify=False,
+            limits=httpx.Limits(
+                max_connections=max_concurrency + 32,
+                max_keepalive_connections=max(20, max_concurrency),
+            ),
         )
 
         self.client = OpenAI(
             base_url=self.base_url,
             api_key=self.api_key if self.api_key else None,
             timeout=httpx.Timeout(60.0, connect=10.0, read=read_timeout, write=10.0),
-            max_retries=3,
-            http_client=http_client,
+            max_retries=MAX_RETRIES,
+            http_client=self._http_client,
         )
 
     def measure_single(self, prompt: str, max_tokens: int) -> Dict:
@@ -177,7 +199,7 @@ class LLMBenchmark:
 
             # Process stream with chunk timeout protection
             last_chunk_time = time.time()
-            chunk_timeout = 100
+            chunk_timeout = self.chunk_timeout
 
             for event in stream:
                 current_time = time.time()
@@ -280,10 +302,11 @@ class LLMBenchmark:
         """
         loop = asyncio.get_running_loop()
         results = []
+        executor = ThreadPoolExecutor(max_workers=concurrency)
 
         # Add timeout to concurrent execution
-        async with asyncio.timeout(batch_timeout):
-            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        try:
+            async with asyncio.timeout(batch_timeout):
                 futures = [
                     loop.run_in_executor(
                         executor, 
@@ -305,6 +328,24 @@ class LLMBenchmark:
                     finally:
                         completed_count += 1
                         progress_callback(completed_count, len(prompts))
+        except TimeoutError:
+            # Discard semantics: partial results are thrown away because some
+            # requests completed abnormally (under the timeout's shadow).
+            logger.warning(
+                f"Batch timed out after {batch_timeout:.0f}s; discarding all "
+                f"{len(results)} partial results for this concurrency level."
+            )
+            st.info(
+                f"Batch timeout ({batch_timeout:.0f}s) reached — discarding "
+                f"partial results and draining in-flight requests "
+                f"(the UI pauses until the server is idle)..."
+            )
+            raise
+        finally:
+            # Cancels queued-but-not-yet-started requests and waits for the
+            # in-flight ones to finish, so that leftover requests from a
+            # discarded level cannot pollute the next level's measurement.
+            executor.shutdown(wait=True, cancel_futures=True)
 
         return results
 
@@ -347,12 +388,21 @@ class LLMBenchmark:
                 "p90": sorted_data[min(int(math.ceil(len(sorted_data) * 0.9)) - 1, len(sorted_data) - 1)] if sorted_data else 0
             }
 
+        error_count = len(results) - len(valid_results)
+
         return {
             "TTFT": calculate_percentiles(ttfts),
             "ITL": calculate_percentiles(itls),
             "TPS": calculate_percentiles(tps_list),
             "Latency": calculate_percentiles(latencies),
-            "Throughput (RPS)": throughput
+            "Throughput (RPS)": throughput,
+            "Requests": {
+                "valid": len(valid_results),
+                "errors": error_count,
+                "total": len(results),
+                # Percentage of failed requests at this concurrency level.
+                "error_rate": (error_count / len(results) * 100.0) if results else 0.0,
+            },
         }
 
     def plot_results(self, all_metrics: Dict) -> Dict[str, go.Figure]:
@@ -464,7 +514,7 @@ class LLMBenchmark:
             calib_ttft_s = calib["ttft"] / TO_MS
 
         read_timeout = max(60.0, calib_ttft_s * max_conc * 0.4 + 30.0)
-        self._build_client(read_timeout)
+        self._build_client(read_timeout, max_concurrency=max_conc)
         st.write(
             f"Calibration: latency={calib_latency:.2f}s, ttft={calib_ttft_s:.2f}s "
             f"=> read_timeout={read_timeout:.0f}s"
@@ -483,13 +533,18 @@ class LLMBenchmark:
 
         prev_latency = calib_latency
         for conc in concurrency_levels:
+            # Wall-clock budget per batch grows with concurrency: near
+            # saturation latency rises superlinearly, so a fixed 3x slack
+            # would time out and discard whole levels (e.g. 128 -> 256).
+            slack = 3.0 + conc / 128.0
+
             warmup_needed = WARMUP_ROUNDS * conc
             if warmup_needed <= len(prompts):
                 warmup_batch = prompts[:warmup_needed]
             else:
                 warmup_batch = [prompts[i % len(prompts)] for i in range(warmup_needed)]
 
-            warmup_timeout = max(300.0, WARMUP_ROUNDS * prev_latency * 3.0)
+            warmup_timeout = max(300.0, WARMUP_ROUNDS * prev_latency * slack)
             logger.info(
                 f"Warmup for concurrency {conc}: {len(warmup_batch)} requests "
                 f"(timeout={warmup_timeout:.0f}s)"
@@ -511,7 +566,7 @@ class LLMBenchmark:
             else:
                 batch = [prompts[i % len(prompts)] for i in range(needed)]
 
-            batch_timeout = max(300.0, MEASURED_ROUNDS * prev_latency * 3.0)
+            batch_timeout = max(300.0, MEASURED_ROUNDS * prev_latency * slack)
             st.write(
                 f"Running with concurrency level: {conc} "
                 f"({len(batch)} prompts, {len(batch)//conc} rounds) "
@@ -533,6 +588,18 @@ class LLMBenchmark:
                 st.write(f"Metrics for concurrency level {conc}:")
                 st.json(metrics)
 
+            except TimeoutError:
+                logger.error(
+                    f"Concurrency {conc} DISCARDED: batch timeout "
+                    f"({batch_timeout:.0f}s) reached; partial results thrown "
+                    f"away and in-flight requests drained."
+                )
+                st.error(
+                    f"Concurrency {conc} DISCARDED: batch timeout "
+                    f"({batch_timeout:.0f}s) reached. Partial results were "
+                    f"thrown away; continuing with the next level."
+                )
+                continue
             except Exception as e:
                 logger.error(f"Error running benchmark with concurrency {conc}: {e}")
                 st.error(f"Error with concurrency {conc}: {e}")
@@ -661,7 +728,9 @@ def create_results_dataframe(all_metrics: Dict) -> pd.DataFrame:
                 "Latency (Mean, s)": f"{metrics['Latency']['mean']:.2f}",
                 "Latency (p50, s)": f"{metrics['Latency']['p50']:.2f}",
                 "Latency (p90, s)": f"{metrics['Latency']['p90']:.2f}",
-                "Throughput (RPS)": f"{metrics['Throughput (RPS)']:.2f}"
+                "Throughput (RPS)": f"{metrics['Throughput (RPS)']:.2f}",
+                "Valid Requests": f"{metrics['Requests']['valid']}/{metrics['Requests']['total']}",
+                "Error Rate (%)": f"{metrics['Requests']['error_rate']:.2f}"
             })
     return pd.DataFrame(data)
 
@@ -769,7 +838,7 @@ def main() -> None:
     # Benchmark parameters
     concurrency_levels = st.sidebar.multiselect(
         "Concurrency Levels", 
-        options=[1, 2, 4, 8, 16, 32, 64], 
+        options=[1, 2, 4, 8, 16, 32, 64, 128, 256], 
         default=DEFAULT_CONCURRENCY_LEVELS
     )
 

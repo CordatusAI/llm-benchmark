@@ -13,8 +13,8 @@ An interactive Streamlit application for benchmarking LLM inference servers with
 ## Features
 
 - **OpenAI-Compatible API Support** — Works with any server exposing the `/v1/chat/completions` endpoint (vLLM, SGLang, TensorRT-LLM, Ollama, etc.)
-- **Multi-Concurrency Testing** — Benchmark at concurrency levels 1 through 64 simultaneously
-- **Comprehensive Metrics** — TTFT, ITL, TPS, Latency, and Throughput with Mean/P50/P90 percentiles
+- **Multi-Concurrency Testing** — Benchmark at concurrency levels 1 through 256 simultaneously
+- **Comprehensive Metrics** — TTFT, ITL, TPS, Latency, and Throughput with Mean/P50/P90 percentiles, plus valid/failed request counts per level
 - **SLO-Driven Capacity Planning** — Determine max concurrency and total users based on configurable TTFT/TPS thresholds using Little's Law
 - **Interactive Visualizations** — Grouped bar charts (Mean vs P90) for all metrics via Plotly
 - **One-Click Download** — Export all results as a ZIP archive containing CSV tables, PNG charts, interactive HTML plots, and the raw `models.json` payload from the server
@@ -61,7 +61,8 @@ docker run -p 8501:8501 --add-host=host.docker.internal:host-gateway llm-benchma
 | **ITL** | ms | Inter-Token Latency — average time between consecutive tokens |
 | **TPS** | tokens/s | Tokens Per Second — output generation speed |
 | **Latency** | s | Total request latency from start to finish |
-| **Throughput** | RPS | Requests Per Second — aggregate throughput at given concurrency |
+| **Throughput** | RPS | Requests Per Second — computed as `num_requests / sum(latencies)`, i.e. `1 / mean latency`. This is the per-stream completion rate at the given concurrency, **not** the aggregate system throughput |
+| **Error Rate** | % | Percentage of failed requests (timeouts, connection errors, empty responses) at the given concurrency level |
 
 Each metric is reported with **Mean**, **P50** (median), and **P90** (90th percentile) values.
 
@@ -77,6 +78,12 @@ Each metric is reported with **Mean**, **P50** (median), and **P90** (90th perce
 | Total requests per level | 11 × concurrency | e.g., concurrency=8 → 88 requests (8 warmup + 80 measured) |
 
 Both input and output are approximately 128 tokens, creating a consistent and reproducible benchmark workload.
+
+### Methodology Notes
+
+- **Retries**: each request allows at most 1 transport-level retry (`MAX_RETRIES`). Successful requests include any retry time in their measured latency; failed requests are counted in the error rate instead of being silently retried indefinitely.
+- **Timeout policy**: each concurrency level runs with a wall-clock budget of `rounds × previous_latency × (3 + concurrency / 128)` seconds (minimum 300 s). If the budget is exceeded, the **entire level is discarded** (no partial results are mixed into the report) and in-flight requests are drained before the next level starts, so discarded levels cannot pollute the following measurements.
+- **Connection pool**: the HTTP connection pool is sized to the highest concurrency level under test, so high-concurrency requests are not queued client-side.
 
 ## Capacity Planning
 
@@ -155,6 +162,7 @@ Constants can be modified at the top of `benchmark.py`:
 | `DEFAULT_TPS_SLO` | 15 | TPS threshold (tokens/s) |
 | `DEFAULT_THINK_TIME` | 45 | Think time (seconds) |
 | `REQUEST_TIMEOUT` | 50 | Request timeout (seconds) |
+| `MAX_RETRIES` | 1 | Transport-level retries allowed per request |
 
 ## Project Structure
 
@@ -170,7 +178,7 @@ llm_benchmark/
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.11+
 - httpx
 - openai
 - pandas
